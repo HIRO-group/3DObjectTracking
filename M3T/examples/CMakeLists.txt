@@ -52,3 +52,15 @@ if (USE_AZURE_KINECT)
     add_executable(run_on_camera_sequence run_on_camera_sequence.cpp)
     target_link_libraries(run_on_camera_sequence PUBLIC m3t)
 endif ()
+# Append these lines to 3DObjectTracking/M3T/examples/CMakeLists.txt
+# Debian/Ubuntu dependencies: libzmq3-dev cppzmq-dev nlohmann-json3-dev
+find_path(CPPZMQ_INCLUDE_DIR zmq.hpp)
+find_path(NLOHMANN_JSON_INCLUDE_DIR nlohmann/json.hpp)
+find_library(ZMQ_LIBRARY NAMES zmq)
+if(NOT CPPZMQ_INCLUDE_DIR OR NOT NLOHMANN_JSON_INCLUDE_DIR OR NOT ZMQ_LIBRARY)
+    message(FATAL_ERROR "run_newton_stream requires cppzmq, nlohmann-json and libzmq")
+endif()
+add_executable(run_newton_stream run_newton_stream.cpp)
+target_include_directories(run_newton_stream PRIVATE
+    ${CPPZMQ_INCLUDE_DIR} ${NLOHMANN_JSON_INCLUDE_DIR})
+target_link_libraries(run_newton_stream PRIVATE m3t ${ZMQ_LIBRARY})
