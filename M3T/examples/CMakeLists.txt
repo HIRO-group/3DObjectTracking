@@ -64,3 +64,15 @@ add_executable(run_newton_stream run_newton_stream.cpp)
 target_include_directories(run_newton_stream PRIVATE
     ${CPPZMQ_INCLUDE_DIR} ${NLOHMANN_JSON_INCLUDE_DIR})
 target_link_libraries(run_newton_stream PRIVATE m3t ${ZMQ_LIBRARY})
+# Append once to ~/3DObjectTracking/M3T/examples/CMakeLists.txt
+# Reuses the cppzmq/nlohmann-json/libzmq variables from your original bridge target.
+find_path(BUNNY_CPPZMQ_INCLUDE_DIR zmq.hpp)
+find_path(BUNNY_JSON_INCLUDE_DIR nlohmann/json.hpp)
+find_library(BUNNY_ZMQ_LIBRARY NAMES zmq)
+if(NOT BUNNY_CPPZMQ_INCLUDE_DIR OR NOT BUNNY_JSON_INCLUDE_DIR OR NOT BUNNY_ZMQ_LIBRARY)
+    message(FATAL_ERROR "run_newton_bunny requires zmq.hpp, nlohmann/json.hpp, libzmq")
+endif()
+add_executable(run_newton_bunny run_newton_bunny.cpp)
+target_include_directories(run_newton_bunny PRIVATE
+    ${BUNNY_CPPZMQ_INCLUDE_DIR} ${BUNNY_JSON_INCLUDE_DIR})
+target_link_libraries(run_newton_bunny PRIVATE m3t ${BUNNY_ZMQ_LIBRARY})
