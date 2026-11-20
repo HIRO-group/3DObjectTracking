@@ -1,12 +1,15 @@
-// Newton RGB pair (ZMQ 5557) -> M3T RGB-only tracker -> pose (ZMQ 5559).
-// M3T has its own camera-0-centered world; emitted poses use Newton world.
-// No Newton ground-truth input is used by this process.
-#include <m3t/static_detector.h>
+// Two-camera known-pose M3T bridge for REAL RGB cameras.
+// Stereo initialization comes from initialize_cube_stereo.py (one-time clicks
+// in both images). After startup, only live RGB pairs are used for tracking.
+// Requires CAMERA_JSON CUBE_OBJ CACHE_DIR INITIAL_POSE_JSON [FRAMES] [POSE].
+
+// Two RGB camera images (ZMQ 5557) -> M3T RGB tracker -> poses (ZMQ 5559).
+// Calibration world here is camera 0 optical frame; no Newton input is used.
 #include <m3t/body.h>
 #include <m3t/camera.h>
 #include <m3t/common.h>
 #include <m3t/link.h>
-#include <m3t/detector.h>
+#include <m3t/static_detector.h>
 #include <m3t/normal_viewer.h>
 #include <m3t/optimizer.h>
 #include <m3t/publisher.h>
@@ -28,7 +31,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <set>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -51,6 +53,25 @@ m3t::Transform3fA ReadPose(const Json& matrix) {
     for (int c = 0; c < 4; ++c)
       result.matrix()(r, c) = matrix.at(r).at(c).get<float>();
   }
+  return result;
+}
+
+m3t::Transform3fA ReadInitialPose(const fs::path& path) {
+  std::ifstream stream(path);
+  if (!stream) throw std::runtime_error("Initial stereo pose not found: " + path.string());
+  const Json j = Json::parse(stream);
+  const auto& p = j.at("position_m");
+  const auto& q = j.at("quat_xyzw");
+  if (p.size() != 3 || q.size() != 4) throw std::runtime_error("Invalid initial pose size");
+  const Eigen::Vector3f xyz(p.at(0).get<float>(), p.at(1).get<float>(), p.at(2).get<float>());
+  Eigen::Quaternionf quat(q.at(3).get<float>(), q.at(0).get<float>(),
+                          q.at(1).get<float>(), q.at(2).get<float>());
+  if (!xyz.allFinite() || !quat.coeffs().allFinite() || quat.norm() < 1e-7f)
+    throw std::runtime_error("Invalid NaN/zero initial pose");
+  quat.normalize();
+  m3t::Transform3fA result = m3t::Transform3fA::Identity();
+  result.linear() = quat.toRotationMatrix();
+  result.translation() = xyz;
   return result;
 }
 
@@ -163,7 +184,7 @@ class SharedPairSource {
   bool ReceiveLatest() {
     try {
       if (!ReceivePacket(zmq::recv_flags::none)) {
-        std::cerr << "[m3t] Frame timeout/bad packet; is Newton running?" << std::endl;
+        std::cerr << "[m3t] Frame timeout/bad packet; is the real-camera publisher running?" << std::endl;
         return false;
       }
       // Keep the newest COMPLETE pair already queued, avoiding extra latency.
@@ -207,134 +228,6 @@ class NewtonColorCamera final : public m3t::ColorCamera {
  private:
   int index_;
   std::shared_ptr<SharedPairSource> source_;
-};
-
-// RGB-only automatic initializer for the distinctively blue Newton cube.
-// M3T has no built-in image-based auto-detector. This intentionally uses camera
-// pixels, camera calibration, known tabletop height and known initial upright
-// orientation; it NEVER reads Newton object state or ground-truth poses.
-class AutoBlueCubeDetector final : public m3t::Detector {
- public:
-  AutoBlueCubeDetector(const std::shared_ptr<m3t::Optimizer>& optimizer,
-                       const std::shared_ptr<m3t::ColorCamera>& cam0,
-                       const std::shared_ptr<m3t::ColorCamera>& cam1,
-                       const Calibration& calibration0,
-                       const Calibration& calibration1)
-      : m3t::Detector("automatic_blue_cube_detector", true),
-        optimizer_(optimizer), cam0_(cam0), cam1_(cam1),
-        calibration0_(calibration0), calibration1_(calibration1) {}
-
-  bool SetUp() override {
-    set_up_ = optimizer_ && optimizer_->set_up() &&
-              cam0_ && cam0_->set_up() && cam1_ && cam1_->set_up();
-    return set_up_;
-  }
-
-  bool DetectPoses(const std::set<std::string>& names,
-                   std::set<std::string>* detected_names = nullptr) override {
-    if (!set_up_) return false;
-    if (!names.count(optimizer_->name())) return true;
-    ++attempts_;
-    cv::Point2f uv0, uv1;
-    if (!FindBlueCubeCenter(cam0_->image(), &uv0) ||
-        !FindBlueCubeCenter(cam1_->image(), &uv1)) {
-      if (attempts_ % 30 == 1)
-        std::cout << "[m3t] Auto-init: waiting for blue cube masks in BOTH cameras\n";
-      return true;  // No detection yet; M3T will retry next camera pair.
-    }
-
-    // The upright 3-inch cube center is 1.5 inches above Newton's z=0 table.
-    // Use both camera observations, not Newton's body position.
-    constexpr float kCubeCenterZ = 0.0381f;
-    Eigen::Vector3f w0, w1;
-    if (!PointOnKnownHeightPlane(uv0, calibration0_, kCubeCenterZ, &w0) ||
-        !PointOnKnownHeightPlane(uv1, calibration1_, kCubeCenterZ, &w1)) {
-      if (attempts_ % 30 == 1)
-        std::cout << "[m3t] Auto-init: invalid camera ray / calibration\n";
-      return true;
-    }
-    const float disagreement_m = (w0.head<2>() - w1.head<2>()).norm();
-    if (disagreement_m > 0.10f) {
-      if (attempts_ % 30 == 1)
-        std::cout << "[m3t] Auto-init: two-camera centers disagree by "
-                  << disagreement_m << " m; check blue mask/calibration\n";
-      return true;
-    }
-    Eigen::Vector3f world_center = 0.5f * (w0 + w1);
-    world_center.z() = kCubeCenterZ;
-
-    // Initial Newton cube orientation is upright and axis-aligned. The cube's
-    // rotation is NOT read from Newton; M3T will refine it while tracking.
-    m3t::Transform3fA newton_from_cube = m3t::Transform3fA::Identity();
-    newton_from_cube.translation() = world_center;
-
-    // This M3T instance uses camera 0 as its internal world reference frame.
-    const m3t::Transform3fA m3t_from_cube =
-        calibration0_.newton_from_camera.inverse() * newton_from_cube;
-    UpdatePoses(m3t_from_cube, optimizer_);
-    if (detected_names) detected_names->insert(optimizer_->name());
-    std::cout << "[m3t] Auto-initialized from two RGB views: Newton XYZ=["
-              << world_center.x() << ", " << world_center.y() << ", "
-              << world_center.z() << "] m (camera disagreement "
-              << disagreement_m * 1000.0f << " mm)\n";
-    return true;
-  }
-
-  std::vector<std::shared_ptr<m3t::Optimizer>> optimizer_ptrs() const override {
-    return {optimizer_};
-  }
-  std::shared_ptr<m3t::Camera> camera_ptr() const override { return cam0_; }
-
- private:
-  static bool FindBlueCubeCenter(const cv::Mat& bgr, cv::Point2f* center) {
-    if (bgr.empty() || bgr.type() != CV_8UC3) return false;
-    cv::Mat hsv, mask;
-    cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
-    // For the Newton default --cube-color-rgb 35 100 230. OpenCV hue is 0..179.
-    // Widen/narrow these thresholds if lighting changes the rendered pixels.
-    cv::inRange(hsv, cv::Scalar(90, 65, 35), cv::Scalar(135, 255, 255), mask);
-    cv::morphologyEx(mask, mask, cv::MORPH_OPEN,
-                     cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
-    cv::Mat labels, stats, centroids;
-    const int n = cv::connectedComponentsWithStats(
-        mask, labels, stats, centroids, 8, CV_32S);
-    int selected = -1, best_area = 70;
-    for (int i = 1; i < n; ++i) {
-      int area = stats.at<int>(i, cv::CC_STAT_AREA);
-      if (area > best_area && area < bgr.rows * bgr.cols / 3) {
-        best_area = area;
-        selected = i;
-      }
-    }
-    if (selected < 0) return false;
-    *center = cv::Point2f(float(centroids.at<double>(selected, 0)),
-                          float(centroids.at<double>(selected, 1)));
-    return true;
-  }
-
-  static bool PointOnKnownHeightPlane(const cv::Point2f& pixel,
-                                      const Calibration& cal, float z,
-                                      Eigen::Vector3f* world_point) {
-    const auto& K = cal.intr;
-    const Eigen::Vector3f direction_camera(
-        (pixel.x - K.ppu) / K.fu, (pixel.y - K.ppv) / K.fv, 1.0f);
-    const Eigen::Vector3f direction_world =
-        cal.newton_from_camera.linear() * direction_camera;
-    const Eigen::Vector3f camera_origin =
-        cal.newton_from_camera.translation();
-    if (std::abs(direction_world.z()) < 1e-5f) return false;
-    const float distance_along_ray =
-        (z - camera_origin.z()) / direction_world.z();
-    if (!(distance_along_ray > 0) || !std::isfinite(distance_along_ray))
-      return false;
-    *world_point = camera_origin + distance_along_ray * direction_world;
-    return world_point->allFinite();
-  }
-
-  std::shared_ptr<m3t::Optimizer> optimizer_;
-  std::shared_ptr<m3t::ColorCamera> cam0_, cam1_;
-  Calibration calibration0_, calibration1_;
-  int attempts_ = 0;
 };
 
 class JsonPosePublisher final : public m3t::Publisher {
@@ -390,26 +283,27 @@ class JsonPosePublisher final : public m3t::Publisher {
 };
 
 int main(int argc, char** argv) {
-  if (argc < 4 || argc > 6) {
+  if (argc < 5 || argc > 7) {
     std::cerr << "Usage: run_newton_stream CAMERA_JSON CUBE_OBJ MODEL_CACHE_DIR "
-                 "[FRAMES_ENDPOINT] [POSE_BIND_ENDPOINT]\n";
+                 "INITIAL_POSE_JSON [FRAMES_ENDPOINT] [POSE_BIND_ENDPOINT]\n";
     return 2;
   }
   try {
     const fs::path calibration_path = argv[1];
     const fs::path mesh_path = argv[2];
     const fs::path cache_dir = argv[3];
-    const std::string frame_endpoint = argc >= 5 ? argv[4] : "tcp://127.0.0.1:5557";
-    const std::string pose_endpoint = argc >= 6 ? argv[5] : "tcp://127.0.0.1:5559";
+    const fs::path initial_pose_path = argv[4];
+    const std::string frame_endpoint = argc >= 6 ? argv[5] : "tcp://127.0.0.1:5557";
+    const std::string pose_endpoint = argc >= 7 ? argv[6] : "tcp://127.0.0.1:5559";
     fs::create_directories(cache_dir);
     const auto c = LoadCalibration(calibration_path);
     if (c[0].width != c[1].width || c[0].height != c[1].height)
       throw std::runtime_error("Two streamed cameras must use matching resolutions");
-    if (!fs::exists(mesh_path)) throw std::runtime_error("Cube mesh not found");
+    if (!fs::exists(mesh_path)) throw std::runtime_error("Object mesh not found");
 
-    // Keep M3T's internal world equal to camera 0 for compatibility with the
-    // existing dashboard publisher. Relative camera 1 pose:
-    // T_m3t_from_cam1 = inv(T_newton_from_cam0) * T_newton_from_cam1.
+    // M3T world is the camera0 optical frame for these real-camera experiments.
+    // Camera1 pose is loaded from stereo calibration relative to camera0:
+    // T_cam0_from_cam1 = inv(T_calib_world_from_cam0) * T_calib_world_from_cam1.
     const m3t::Transform3fA newton_from_m3t = c[0].newton_from_camera;
     const m3t::Transform3fA m3t_from_camera1 =
         newton_from_m3t.inverse() * c[1].newton_from_camera;
@@ -439,46 +333,14 @@ int main(int argc, char** argv) {
     auto optimizer = std::make_shared<m3t::Optimizer>("cube_optimizer", link);
     tracker->AddOptimizer(optimizer);
 
-    // -----------------------------------------------------------
-    // INITIALIZATION USING KNOWN STARTING POSE
-    // -----------------------------------------------------------
-
-    // Initial cube pose in Newton's world coordinates.
-    // Position is in meters.
-    //
-    // Cube dimensions: 0.0762 x 0.0762 x 0.0762 m
-    // Table surface: z = 0
-    // Cube center height: 0.0381 m
-
-    m3t::Transform3fA initial_cube_newton =
-        m3t::Transform3fA::Identity();
-
-    initial_cube_newton.translation() =
-        Eigen::Vector3f(0.0f, 0.0f, 0.0381f);
-
-    // Initial orientation is identity.
-    // The cube starts aligned with Newton's world axes.
-
-    // Convert Newton's world coordinates into M3T's
-    // camera-0-centered coordinate system.
-
-    m3t::Transform3fA initial_cube_m3t =
-        newton_from_m3t.inverse() * initial_cube_newton;
-
-    // Initialize M3T using the known starting pose.
-
-    auto detector = std::make_shared<m3t::StaticDetector>(
-        "known_initial_cube_pose",
-        optimizer,
-        initial_cube_m3t
-    );
-
-    tracker->AddDetector(detector);
-
-std::cout
-    << "[m3t] Using known initial cube pose." << std::endl
-    << "[m3t] Position: (0, 0, 0.0381) m" << std::endl
-    << "[m3t] Orientation: identity" << std::endl;
+    // Stereo initialization was solved against undistorted frames in the
+    // calibrated camera0 optical coordinate frame. Here M3T world = camera0.
+    // StaticDetector applies it once. M3T still tracks images after startup.
+    const m3t::Transform3fA cam0_from_cube = ReadInitialPose(initial_pose_path);
+    tracker->AddDetector(std::make_shared<m3t::StaticDetector>(
+        "stereo_cube_initial_pose", optimizer, cam0_from_cube));
+    std::cout << "[m3t] Stereo-initialized camera0 cube center: "
+              << cam0_from_cube.translation().transpose() << " meters\n";
     tracker->AddPublisher(std::make_shared<JsonPosePublisher>(
         cube, source, newton_from_m3t, pose_endpoint));
     tracker->AddViewer(std::make_shared<m3t::NormalColorViewer>(
@@ -486,16 +348,14 @@ std::cout
     tracker->AddViewer(std::make_shared<m3t::NormalColorViewer>(
         "m3t_cam1_overlay", cam1, render_geometry));
 
-    std::cout
-    << "[m3t] Configured RGB-only multi-camera tracking.\n"
-    << "[m3t] Initializing from known starting pose.\n"
-    << "[m3t] Press 'q' in a tracking viewer to quit.\n";
+    std::cout << "[m3t] Stereo initial pose loaded once; no M3T corner clicks.\n"
+              << "[m3t] Configured RGB-only two-camera tracking.\n"
+              << "[m3t] Press 'q' in a tracking viewer to quit.\n";
     if (!tracker->SetUp()) {
       std::cerr << "[m3t] Tracker setup failed" << std::endl;
       return 1;
     }
-    // Attempt auto-detection immediately and retry until both masks succeed.
-    // Start tracking automatically AFTER successful detection.
+    // StaticDetector loads the initial pose once; tracking starts automatically.
     if (!tracker->RunTrackerProcess(true, false)) {
       std::cerr << "[m3t] Tracker loop ended with failure" << std::endl;
       return 1;
